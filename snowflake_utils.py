@@ -1,5 +1,6 @@
 import snowflake.connector
 import requests
+import sqlparse
 import yaml
 
 class SnowflakeConnectionError(Exception):
@@ -241,6 +242,69 @@ def get_stage_file_url(conn, stage_full_name, file_name):
         return url
     except Exception as e:
         raise Exception(f"Error generating stage file URL for {file_name} in stage {stage_full_name}: {e}")
+
+# ------------------------------------
+# SQL execution helpers
+# ------------------------------------
+
+def split_sql_statements(sql_text):
+    """
+    Split SQL script into individual statements using sqlparse.
+    """
+    return [stmt.strip() for stmt in sqlparse.split(sql_text) if stmt and stmt.strip()]
+
+def execute_sql_script(conn, sql_text):
+    """
+    Execute a multi-statement SQL script.
+    Returns a list of result dicts: { 'statement': str, 'success': bool, 'rows_affected': int, 'error': str }
+    """
+    results = []
+    statements = split_sql_statements(sql_text)
+    cur = conn.cursor()
+    for stmt in statements:
+        try:
+            cur.execute(stmt)
+            try:
+                # For DML/DDL, rowcount may be -1; normalize to 0
+                rows = cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+            except Exception:
+                rows = 0
+            results.append({
+                'statement': stmt[:2000],
+                'success': True,
+                'rows_affected': rows,
+                'error': ''
+            })
+        except Exception as e:
+            results.append({
+                'statement': stmt[:2000],
+                'success': False,
+                'rows_affected': 0,
+                'error': str(e)
+            })
+    cur.close()
+    return results
+
+def execute_sql_file(conn, file_path):
+    """
+    Read a local SQL file and execute it.
+    """
+    try:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            sql_text = f.read()
+        return execute_sql_script(conn, sql_text)
+    except Exception as e:
+        raise Exception(f"Error executing SQL file {file_path}: {e}")
+
+def execute_sql_from_stage(conn, stage_full_name, file_name):
+    """
+    Read a SQL file from a Snowflake stage and execute it.
+    """
+    try:
+        sql_text = read_file_from_stage(conn, stage_full_name, file_name)
+        return execute_sql_script(conn, sql_text)
+    except Exception as e:
+        raise Exception(f"Error executing SQL from stage {stage_full_name}/{file_name}: {e}")
 
 def list_and_read_yaml_files_from_stage(conn, stage_full_name, database=None):
     """

@@ -42,7 +42,7 @@ if st.sidebar.button("Connect"):
 
 if st.session_state.get("connected") and st.session_state.get("conn"):
     conn = st.session_state['conn']
-    section = st.radio("Choose a module:", ["Data Object Explorer", "Data Explorer", "Lineage Designer"])  # added lineage
+    section = st.radio("Choose a module:", ["Data Object Explorer", "Data Explorer", "Lineage Designer", "Environment Setup"])  # added setup
 
     if section == "Data Object Explorer":
         st.header("Data Object Explorer")
@@ -108,6 +108,49 @@ if st.session_state.get("connected") and st.session_state.get("conn"):
                 st.error(f"Failed to parse uploaded YAML: {e}")
         else:
             st.info("Upload a semantic YAML file to begin.")
+
+    elif section == "Environment Setup":
+        st.header("Environment Setup")
+        st.caption("Execute SQL to set up Snowflake objects.")
+
+        # Option 1: Run local repo setup.sql
+        if st.button("Run local setup.sql"):
+            try:
+                from snowflake_utils import execute_sql_file
+                results = execute_sql_file(conn, "/Users/bsuresh/Documents/ey_data_next/setup.sql")
+                st.subheader("Execution Results: local setup.sql")
+                st.json(results)
+            except Exception as e:
+                st.error(str(e))
+
+        # Option 2: Upload and run a SQL file
+        uploaded_sql = st.file_uploader("Upload a SQL script", type=["sql"], key="setup_sql_upload")
+        if uploaded_sql is not None:
+            if st.button("Execute uploaded SQL"):
+                try:
+                    sql_text = uploaded_sql.read().decode("utf-8")
+                    from snowflake_utils import execute_sql_script
+                    results = execute_sql_script(conn, sql_text)
+                    st.subheader("Execution Results: uploaded SQL")
+                    st.json(results)
+                except Exception as e:
+                    st.error(str(e))
+
+        # Option 3: Execute SQL stored in a stage
+        st.subheader("Execute SQL from Stage")
+        stage_name_input = st.text_input("Stage full name (e.g., DB.SCHEMA.STAGE)", key="setup_stage_name")
+        stage_file_input = st.text_input("SQL file path in stage", key="setup_stage_file")
+        if st.button("Execute stage SQL"):
+            if not stage_name_input or not stage_file_input:
+                st.error("Please enter both stage and file path.")
+            else:
+                try:
+                    from snowflake_utils import execute_sql_from_stage
+                    results = execute_sql_from_stage(conn, stage_name_input, stage_file_input)
+                    st.subheader("Execution Results: stage SQL")
+                    st.json(results)
+                except Exception as e:
+                    st.error(str(e))
 
     elif section == "Lineage Designer":
         st.header("Lineage Designer")
