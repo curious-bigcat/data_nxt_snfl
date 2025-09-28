@@ -1,0 +1,5 @@
+streamlit
+snowflake-connector-python
+pyyaml
+openai>=1.0.0
+graphviz
