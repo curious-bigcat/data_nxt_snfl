@@ -2,10 +2,11 @@ import streamlit as st
 from snowflake_utils import connect_to_snowflake, list_data_objects, get_schema_objects, get_table_or_view_columns, list_stages, list_files_in_stage, read_file_from_stage, SnowflakeConnectionError
 import yaml
 import csv
+import io
 import re
 from ai_services import generate_business_glossary_from_yaml, generate_lineage_dot
 
-st.title("Data Explorer")
+st.title("Business Glossary")
 
 st.sidebar.header("Snowflake Connection")
 
@@ -42,41 +43,75 @@ if st.sidebar.button("Connect"):
 
 if st.session_state.get("connected") and st.session_state.get("conn"):
     conn = st.session_state['conn']
-    section = st.radio("Choose a module:", ["Data Object Explorer", "Data Explorer", "Lineage Designer", "Environment Setup"])  # added setup
+    section = st.radio("Choose a module:", ["Data Object Explorer", "Business Glossary", "Lineage Designer"])  # removed setup
 
     if section == "Data Object Explorer":
         st.header("Data Object Explorer")
         try:
             data = list_data_objects(conn)
-            db_names = list(data.keys())
-            selected_db = st.selectbox("Select Database", db_names, key="db_obj")
-            schema_names = list(data[selected_db].keys())
-            selected_schema = st.selectbox("Select Schema", schema_names, key="schema_obj")
-            st.write("Tables:", data[selected_db][selected_schema]['tables'])
-            st.write("Views:", data[selected_db][selected_schema]['views'])
+            db_names = sorted(data.keys())
+            selected_db = st.selectbox("Database", db_names, key="explorer_db") if db_names else None
+            if not selected_db:
+                st.info("No databases available.")
+            else:
+                schemas = sorted(data[selected_db].keys())
+                selected_schemas = st.multiselect("Schemas", schemas, default=schemas, key="explorer_schemas")
 
-            # Show all schema objects
-            st.subheader("All Schema Objects (Tables, Views, Stages, File Formats, Sequences, Functions, Procedures, Tasks, Streams, Pipes)")
-            schema_objects = get_schema_objects(conn, selected_db, selected_schema)
-            st.json(schema_objects)
+                # For each selected schema, fetch objects and render top-level expanders per object
+                for schema_name in selected_schemas:
+                    try:
+                        schema_objects = get_schema_objects(conn, selected_db, schema_name)
+                    except Exception as e:
+                        st.error(f"Failed to load schema objects for {selected_db}.{schema_name}: {e}")
+                        continue
 
-            # Table or View columns and data types
-            st.subheader("Inspect Table/View Columns and Data Types")
-            all_objects = schema_objects.get('tables', []) + schema_objects.get('views', [])
-            object_type_map = {name: 'table' for name in schema_objects.get('tables', [])}
-            object_type_map.update({name: 'view' for name in schema_objects.get('views', [])})
-            selected_object = st.selectbox("Select Table or View", all_objects, key="obj_col")
-            if selected_object:
-                obj_type = object_type_map[selected_object]
-                st.markdown(f"**{obj_type.title()} Columns for `{selected_object}`**")
-                columns = get_table_or_view_columns(conn, selected_db, selected_schema, selected_object, object_type=obj_type)
-                st.table(columns)
+                    counts = {k: len(v) for k, v in schema_objects.items() if isinstance(v, list)}
+                    if counts:
+                        st.caption(f"{selected_db}.{schema_name} — " + ", ".join([f"{k}: {v}" for k, v in sorted(counts.items())]))
+
+                    # Tables (one expander per table)
+                    for tbl in sorted(schema_objects.get('tables', [])):
+                        with st.expander(f"Table: {selected_db}.{schema_name}.{tbl}"):
+                            btn_key = f"tbl_btn_{selected_db}_{schema_name}_{tbl}"
+                            if st.button("Show columns", key=btn_key):
+                                try:
+                                    cols = get_table_or_view_columns(conn, selected_db, schema_name, tbl, object_type='table')
+                                    st.table(cols)
+                                except Exception as e:
+                                    st.error(str(e))
+
+                    # Views (one expander per view)
+                    for vw in sorted(schema_objects.get('views', [])):
+                        with st.expander(f"View: {selected_db}.{schema_name}.{vw}"):
+                            btn_key = f"vw_btn_{selected_db}_{schema_name}_{vw}"
+                            if st.button("Show columns", key=btn_key):
+                                try:
+                                    cols = get_table_or_view_columns(conn, selected_db, schema_name, vw, object_type='view')
+                                    st.table(cols)
+                                except Exception as e:
+                                    st.error(str(e))
+
+                    # Other object categories (each item expandable)
+                    def render_expandable_list(items, label):
+                        for name in sorted(items):
+                            with st.expander(f"{label}: {selected_db}.{schema_name}.{name}"):
+                                st.write(f"Name: `{name}`")
+
+                    render_expandable_list(schema_objects.get('stages', []), 'Stage')
+                    render_expandable_list(schema_objects.get('file_formats', []), 'File Format')
+                    render_expandable_list(schema_objects.get('sequences', []), 'Sequence')
+                    render_expandable_list(schema_objects.get('functions', []), 'Function')
+                    render_expandable_list(schema_objects.get('user_functions', []), 'User Function')
+                    render_expandable_list(schema_objects.get('procedures', []), 'Procedure')
+                    render_expandable_list(schema_objects.get('tasks', []), 'Task')
+                    render_expandable_list(schema_objects.get('streams', []), 'Stream')
+                    render_expandable_list(schema_objects.get('pipes', []), 'Pipe')
         except Exception as e:
             st.error(str(e))
 
-    elif section == "Data Explorer":
-        st.header("Data Explorer")
-        st.caption("Upload a semantic YAML file to generate a business glossary.")
+    elif section == "Business Glossary":
+        st.header("Business Glossary")
+        st.caption("Upload a semantic YAML file to generate column-level definitions and synonyms.")
 
         # OpenAI API key input
         with st.sidebar:
@@ -95,8 +130,61 @@ if st.session_state.get("connected") and st.session_state.get("conn"):
                         try:
                             result = generate_business_glossary_from_yaml(openai_api_key, content)
                             if isinstance(result, dict) and "text" not in result:
-                                st.subheader("Business Glossary (JSON)")
-                                st.json(result)
+                                # Expect column-level glossary
+                                columns_glossary = result.get("columns")
+                                if columns_glossary is None and isinstance(result.get("business_glossary"), dict):
+                                    columns_glossary = result["business_glossary"].get("columns")
+                                # Build rows: table, column, definition, synonyms
+                                rows = []
+                                if isinstance(columns_glossary, list):
+                                    for c in columns_glossary:
+                                        if not isinstance(c, dict):
+                                            continue
+                                        table_name = c.get("table") or ""
+                                        column_name = c.get("column") or ""
+                                        definition = c.get("definition") or c.get("description") or ""
+                                        synonyms = c.get("synonyms") or []
+                                        if isinstance(synonyms, list):
+                                            synonyms = ", ".join([str(x) for x in synonyms])
+                                        rows.append({
+                                            "Table": table_name,
+                                            "Column": column_name,
+                                            "Definition": definition,
+                                            "Synonyms": synonyms,
+                                        })
+
+                                st.subheader("Column Glossary")
+                                if rows:
+                                    st.dataframe(rows, use_container_width=True)
+                                    # Download as CSV
+                                    buf = io.StringIO()
+                                    writer = csv.DictWriter(buf, fieldnames=["Table", "Column", "Definition", "Synonyms"])
+                                    writer.writeheader()
+                                    writer.writerows(rows)
+                                    st.download_button(
+                                        "Download Column Glossary CSV",
+                                        data=buf.getvalue(),
+                                        file_name="column_business_glossary.csv",
+                                        mime="text/csv",
+                                    )
+                                else:
+                                    st.info("No column glossary found. Showing raw JSON.")
+                                    st.json(result)
+                                # Optional: also show terms if provided
+                                terms = result.get("terms")
+                                if isinstance(terms, list) and terms:
+                                    term_rows = []
+                                    for t in terms:
+                                        if not isinstance(t, dict):
+                                            continue
+                                        term_rows.append({
+                                            "Term": t.get("term") or t.get("name") or "",
+                                            "Definition": t.get("definition") or t.get("description") or "",
+                                        })
+                                    with st.expander("Business Terms (optional)"):
+                                        st.dataframe(term_rows, use_container_width=True)
+                                with st.expander("Raw JSON response"):
+                                    st.json(result)
                             else:
                                 st.subheader("Business Glossary (Text)")
                                 st.write(result.get("text", ""))
@@ -108,49 +196,6 @@ if st.session_state.get("connected") and st.session_state.get("conn"):
                 st.error(f"Failed to parse uploaded YAML: {e}")
         else:
             st.info("Upload a semantic YAML file to begin.")
-
-    elif section == "Environment Setup":
-        st.header("Environment Setup")
-        st.caption("Execute SQL to set up Snowflake objects.")
-
-        # Option 1: Run local repo setup.sql
-        if st.button("Run local setup.sql"):
-            try:
-                from snowflake_utils import execute_sql_file
-                results = execute_sql_file(conn, "/Users/bsuresh/Documents/ey_data_next/setup.sql")
-                st.subheader("Execution Results: local setup.sql")
-                st.json(results)
-            except Exception as e:
-                st.error(str(e))
-
-        # Option 2: Upload and run a SQL file
-        uploaded_sql = st.file_uploader("Upload a SQL script", type=["sql"], key="setup_sql_upload")
-        if uploaded_sql is not None:
-            if st.button("Execute uploaded SQL"):
-                try:
-                    sql_text = uploaded_sql.read().decode("utf-8")
-                    from snowflake_utils import execute_sql_script
-                    results = execute_sql_script(conn, sql_text)
-                    st.subheader("Execution Results: uploaded SQL")
-                    st.json(results)
-                except Exception as e:
-                    st.error(str(e))
-
-        # Option 3: Execute SQL stored in a stage
-        st.subheader("Execute SQL from Stage")
-        stage_name_input = st.text_input("Stage full name (e.g., DB.SCHEMA.STAGE)", key="setup_stage_name")
-        stage_file_input = st.text_input("SQL file path in stage", key="setup_stage_file")
-        if st.button("Execute stage SQL"):
-            if not stage_name_input or not stage_file_input:
-                st.error("Please enter both stage and file path.")
-            else:
-                try:
-                    from snowflake_utils import execute_sql_from_stage
-                    results = execute_sql_from_stage(conn, stage_name_input, stage_file_input)
-                    st.subheader("Execution Results: stage SQL")
-                    st.json(results)
-                except Exception as e:
-                    st.error(str(e))
 
     elif section == "Lineage Designer":
         st.header("Lineage Designer")
@@ -197,6 +242,9 @@ if st.session_state.get("connected") and st.session_state.get("conn"):
         include_sql_snippets = st.checkbox("Include SQL snippet excerpts", value=False, key="lineage_snippets")
         show_edge_labels = st.checkbox("Show edge operation labels (joins, agg, filter)", value=True, key="lineage_edge_labels")
         show_node_tooltips = st.checkbox("Show node tooltips (summaries)", value=True, key="lineage_tooltips")
+        include_ctes = st.checkbox("Include CTEs as nodes", value=True, key="lineage_ctes")
+        include_column_lineage = st.checkbox("Include column-level lineage hints", value=True, key="lineage_col_lineage")
+        include_file_stage_sources = st.checkbox("Include file/stage sources (COPY INTO, stages)", value=True, key="lineage_file_stage")
 
         additional_instructions = st.text_area(
             "Optional: Additional instructions/context for diagram generation",
@@ -222,7 +270,10 @@ if st.session_state.get("connected") and st.session_state.get("conn"):
                         include_sql_snippets=include_sql_snippets,
                         snippet_max_chars=180,
                         show_edge_labels=show_edge_labels,
-                        show_node_tooltips=show_node_tooltips,
+                            show_node_tooltips=show_node_tooltips,
+                            include_ctes=include_ctes,
+                            include_column_lineage=include_column_lineage,
+                            include_file_and_stage_sources=include_file_stage_sources,
                     )
 
                     if not dot_text.lower().startswith("digraph"):

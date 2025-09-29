@@ -32,10 +32,12 @@ def generate_business_glossary_from_yaml(openai_api_key: str, yaml_content: str)
     parsed = yaml.safe_load(yaml_content)
 
     prompt = (
-        "You are a data governance expert. Given the following semantic YAML, "
-        "produce a concise business glossary: list business terms, definitions, "
-        "related columns/tables, and any data quality notes. Return JSON with keys: "
-        "terms (array of {term, definition, related_columns, tables, dq_notes}).\n\n"
+        "You are a data governance expert. Given the following semantic YAML, produce a business glossary.\n"
+        "Requirements:\n"
+        "- Return JSON only (no prose).\n"
+        "- Include a per-column glossary with definitions and synonyms.\n"
+        "- JSON keys: columns (array of {table, column, definition, synonyms}), terms (optional array of {term, definition, related_columns, tables, dq_notes}).\n"
+        "- In columns.synonyms, include up to 5 concise, business-friendly synonyms; omit duplicates.\n\n"
     )
 
     messages = [
@@ -69,6 +71,9 @@ def generate_lineage_dot(
     snippet_max_chars: int = 180,
     show_edge_labels: bool = True,
     show_node_tooltips: bool = True,
+    include_ctes: bool = True,
+    include_column_lineage: bool = True,
+    include_file_and_stage_sources: bool = True,
 ) -> str:
     """
     Call OpenAI to produce a Graphviz DOT diagram from lineage CSV rows and code blobs.
@@ -182,6 +187,12 @@ def generate_lineage_dot(
         "- Windows: partition/order and functions.",
         "- Materializations: table/view names; note temp/stage objects.",
     ]
+    if include_ctes:
+        detail_parts.append("- Common Table Expressions (CTEs): treat named CTEs as transformation nodes; show edges from their inputs.")
+    if include_file_and_stage_sources:
+        detail_parts.append("- External sources: S3/GCS/Azure stages and COPY INTO; add source nodes for stages and files if referenced.")
+    if include_column_lineage:
+        detail_parts.append("- Column-level lineage: when clear, add edge labels like colA->colB for key columns.")
     if include_sql_snippets:
         detail_parts.append("- Include concise SQL snippet excerpts per transformation (truncated).")
         detail_parts.append(f"- Truncate any SQL snippet to <= {snippet_max_chars} chars.")

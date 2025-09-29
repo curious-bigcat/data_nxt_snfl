@@ -623,48 +623,384 @@ AS
 SELECT * EXCLUDE (year, make, model)
 FROM tb_101.raw_pos.truck;
 
--- Create or replace the Cortex Search Service named 'tasty_bytes_review_search'. --
-CREATE OR REPLACE CORTEX SEARCH SERVICE tb_101.harmonized.tasty_bytes_review_search
-ON REVIEW 
-ATTRIBUTES LANGUAGE, ORDER_ID, REVIEW_ID, TRUCK_BRAND_NAME, PRIMARY_CITY, DATE, SOURCE 
-WAREHOUSE = tb_de_wh
-TARGET_LAG = '1 hour' 
-AS (
-    SELECT
-        REVIEW,             
-        LANGUAGE,           
-        ORDER_ID,           
-        REVIEW_ID,          
-        TRUCK_BRAND_NAME,  
-        PRIMARY_CITY,       
-        DATE,               
-        SOURCE             
-    FROM
-        tb_101.harmonized.truck_reviews_v 
-    WHERE
-        REVIEW IS NOT NULL 
+/*--
+ • New Pipeline: Sales Insights (UDFs, Marts, DQ, Tasks)
+    Depends on tb_101.harmonized.orders_v as upstream source
+--*/
+
+-- Context for object creation
+USE ROLE sysadmin;
+USE WAREHOUSE tb_de_wh;
+USE DATABASE tb_101;
+
+-- Schemas for new artifacts
+CREATE OR REPLACE SCHEMA tb_101.analytics_mart;
+CREATE OR REPLACE SCHEMA tb_101.governance_logs;
+
+-- UDFs (in governance schema)
+USE SCHEMA tb_101.governance;
+
+CREATE OR REPLACE FUNCTION governance.SAFE_DIVIDE(numerator NUMBER, denominator NUMBER)
+RETURNS NUMBER
+IMMUTABLE
+MEMOIZABLE
+COMMENT = 'Safely divide numerator by denominator; returns NULL on zero/NULL denominator'
+AS $$ CASE WHEN denominator IS NULL OR denominator = 0 THEN NULL ELSE numerator / denominator END $$;
+
+CREATE OR REPLACE FUNCTION governance.ZSCORE(x NUMBER, mean NUMBER, stddev NUMBER)
+RETURNS NUMBER
+IMMUTABLE
+MEMOIZABLE
+COMMENT = 'Standard z-score: (x - mean) / stddev; NULL if stddev is 0/NULL'
+AS $$ CASE WHEN stddev IS NULL OR stddev = 0 THEN NULL ELSE (x - mean) / stddev END $$;
+
+CREATE OR REPLACE FUNCTION governance.ROBUST_ZSCORE(x NUMBER, median NUMBER, mad NUMBER)
+RETURNS NUMBER
+IMMUTABLE
+MEMOIZABLE
+COMMENT = 'Robust z-score using median and MAD (scaled by 1.4826)'
+AS $$ CASE WHEN mad IS NULL OR mad = 0 THEN NULL ELSE (x - median) / (1.4826 * mad) END $$;
+
+CREATE OR REPLACE FUNCTION governance.COALESCE_ZERO(x NUMBER)
+RETURNS NUMBER
+IMMUTABLE
+MEMOIZABLE
+COMMENT = 'Coalesce NULL numeric to zero'
+AS $$ COALESCE(x, 0) $$;
+
+-- Tables for marts, KPIs, anomalies, and DQ logs
+USE SCHEMA tb_101.analytics_mart;
+
+CREATE OR REPLACE TABLE tb_101.analytics_mart.fact_daily_item_sales (
+    date DATE,
+    menu_item_id VARCHAR,
+    menu_item_name STRING,
+    truck_brand_name STRING,
+    country STRING,
+    location_id VARCHAR,
+    orders_count NUMBER,
+    order_lines NUMBER,
+    quantity NUMBER,
+    gross_sales NUMBER(38,2),
+    net_sales NUMBER(38,2),
+    last_updated_at TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(),
+    CONSTRAINT ifk_fact_daily_item_sales UNIQUE (date, menu_item_id, location_id)
 );
 
+CREATE OR REPLACE TABLE tb_101.analytics_mart.kpi_daily_brand (
+    date DATE,
+    truck_brand_name STRING,
+    total_orders NUMBER,
+    total_order_lines NUMBER,
+    total_quantity NUMBER,
+    total_sales NUMBER(38,2),
+    avg_order_value NUMBER(38,2),
+    unique_customers NUMBER,
+    last_updated_at TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(),
+    CONSTRAINT ifk_kpi_daily_brand UNIQUE (date, truck_brand_name)
+);
+
+CREATE OR REPLACE TABLE tb_101.analytics_mart.sales_anomalies (
+    date DATE,
+    grain STRING,
+    id STRING,
+    metric_name STRING,
+    metric_value NUMBER(38,2),
+    zscore NUMBER(38,6),
+    robust_zscore NUMBER(38,6),
+    anomaly_flag BOOLEAN,
+    context VARIANT,
+    detected_at TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
+);
+
+USE SCHEMA tb_101.governance_logs;
+
+CREATE OR REPLACE TABLE tb_101.governance_logs.dq_results (
+    run_ts TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(),
+    check_name STRING,
+    severity STRING,
+    status STRING,
+    failed_count NUMBER,
+    sample_rows VARIANT,
+    notes STRING
+);
+
+-- Stored Procedures (SQL) for incremental builds, DQ, and anomalies
+USE SCHEMA tb_101.governance;
+
+CREATE OR REPLACE PROCEDURE governance.sp_build_fact_daily_item_sales(days_back INTEGER DEFAULT 7)
+RETURNS STRING
+LANGUAGE SQL
+EXECUTE AS CALLER
+AS $$
+BEGIN
+    CREATE OR REPLACE TEMP TABLE src_fact AS
+    SELECT
+        DATE(o.order_ts) AS date,
+        o.menu_item_id::VARCHAR AS menu_item_id,
+        o.menu_item_name AS menu_item_name,
+        o.truck_brand_name AS truck_brand_name,
+        o.country AS country,
+        o.location_id::VARCHAR AS location_id,
+        COUNT(DISTINCT o.order_id) AS orders_count,
+        COUNT(*) AS order_lines,
+        SUM(o.quantity) AS quantity,
+        SUM(o.price) AS gross_sales,
+        SUM(o.price) AS net_sales
+    FROM tb_101.harmonized.orders_v o
+    WHERE DATE(o.order_ts) >= DATEADD('day', -days_back, CURRENT_DATE())
+    GROUP BY
+        DATE(o.order_ts), o.menu_item_id::VARCHAR, o.menu_item_name,
+        o.truck_brand_name, o.country, o.location_id::VARCHAR;
+
+    DELETE FROM tb_101.analytics_mart.fact_daily_item_sales
+    WHERE date >= DATEADD('day', -days_back, CURRENT_DATE());
+
+    INSERT INTO tb_101.analytics_mart.fact_daily_item_sales (
+        date, menu_item_id, menu_item_name, truck_brand_name, country, location_id,
+        orders_count, order_lines, quantity, gross_sales, net_sales
+    )
+    SELECT date, menu_item_id, menu_item_name, truck_brand_name, country, location_id,
+           orders_count, order_lines, quantity, gross_sales, net_sales
+    FROM src_fact;
+
+    RETURN 'fact_daily_item_sales built for last ' || days_back || ' days';
+END;
+$$;
+
+CREATE OR REPLACE PROCEDURE governance.sp_build_kpi_daily_brand(days_back INTEGER DEFAULT 7)
+RETURNS STRING
+LANGUAGE SQL
+EXECUTE AS CALLER
+AS $$
+BEGIN
+    CREATE OR REPLACE TEMP TABLE src_kpi AS
+    SELECT
+        f.date,
+        f.truck_brand_name,
+        SUM(f.orders_count) AS total_orders,
+        SUM(f.order_lines) AS total_order_lines,
+        SUM(f.quantity) AS total_quantity,
+        SUM(f.net_sales) AS total_sales,
+        governance.SAFE_DIVIDE(SUM(f.net_sales), NULLIF(SUM(f.orders_count), 0)) AS avg_order_value,
+        COUNT(DISTINCT o.customer_id) AS unique_customers
+    FROM tb_101.analytics_mart.fact_daily_item_sales f
+    LEFT JOIN tb_101.harmonized.orders_v o
+        ON o.truck_brand_name = f.truck_brand_name
+       AND DATE(o.order_ts) = f.date
+    WHERE f.date >= DATEADD('day', -days_back, CURRENT_DATE())
+    GROUP BY f.date, f.truck_brand_name;
+
+    DELETE FROM tb_101.analytics_mart.kpi_daily_brand
+    WHERE date >= DATEADD('day', -days_back, CURRENT_DATE());
+
+    INSERT INTO tb_101.analytics_mart.kpi_daily_brand (
+        date, truck_brand_name, total_orders, total_order_lines, total_quantity, total_sales, avg_order_value, unique_customers
+    )
+    SELECT date, truck_brand_name, total_orders, total_order_lines, total_quantity, total_sales, avg_order_value, unique_customers
+    FROM src_kpi;
+
+    RETURN 'kpi_daily_brand built for last ' || days_back || ' days';
+END;
+$$;
+
+CREATE OR REPLACE PROCEDURE governance.sp_run_dq_checks(days_back INTEGER DEFAULT 7)
+RETURNS STRING
+LANGUAGE SQL
+EXECUTE AS CALLER
+AS $$
+BEGIN
+    INSERT INTO tb_101.governance_logs.dq_results (check_name, severity, status, failed_count, sample_rows, notes)
+    SELECT 'FACT_NULL_KEYS', 'ERROR', IFF(cnt=0, 'PASS', 'FAIL'), cnt,
+           OBJECT_CONSTRUCT('sample_rows', (SELECT ARRAY_AGG(OBJECT_CONSTRUCT(*)) FROM (
+               SELECT * FROM tb_101.analytics_mart.fact_daily_item_sales
+               WHERE date >= DATEADD('day', -days_back, CURRENT_DATE())
+                 AND (menu_item_id IS NULL OR location_id IS NULL)
+               LIMIT 10
+           ))),
+           'menu_item_id/location_id should not be NULL'
+    FROM (
+        SELECT COUNT(*) AS cnt
+        FROM tb_101.analytics_mart.fact_daily_item_sales
+        WHERE date >= DATEADD('day', -days_back, CURRENT_DATE())
+          AND (menu_item_id IS NULL OR location_id IS NULL)
+    );
+
+    INSERT INTO tb_101.governance_logs.dq_results (check_name, severity, status, failed_count, sample_rows, notes)
+    SELECT 'FACT_NON_NEGATIVE', 'ERROR', IFF(cnt=0, 'PASS', 'FAIL'), cnt,
+           NULL, 'quantity, gross_sales, net_sales must be >= 0'
+    FROM (
+        SELECT COUNT(*) AS cnt
+        FROM tb_101.analytics_mart.fact_daily_item_sales
+        WHERE date >= DATEADD('day', -days_back, CURRENT_DATE())
+          AND (quantity < 0 OR gross_sales < 0 OR net_sales < 0)
+    );
+
+    INSERT INTO tb_101.governance_logs.dq_results (check_name, severity, status, failed_count, sample_rows, notes)
+    SELECT 'FACT_DUPLICATES', 'ERROR', IFF(cnt=0, 'PASS', 'FAIL'), cnt,
+           NULL, 'Duplicate rows at (date, menu_item_id, location_id)'
+    FROM (
+        SELECT COUNT(*) AS cnt
+        FROM (
+            SELECT date, menu_item_id, location_id, COUNT(*) c
+            FROM tb_101.analytics_mart.fact_daily_item_sales
+            WHERE date >= DATEADD('day', -days_back, CURRENT_DATE())
+            GROUP BY date, menu_item_id, location_id
+            HAVING COUNT(*) > 1
+        )
+    );
+
+    RETURN 'DQ checks executed for last ' || days_back || ' days';
+END;
+$$;
+
+CREATE OR REPLACE PROCEDURE governance.sp_detect_sales_anomalies(days_back INTEGER DEFAULT 30)
+RETURNS STRING
+LANGUAGE SQL
+EXECUTE AS CALLER
+AS $$
+BEGIN
+    CREATE OR REPLACE TEMP TABLE base AS
+    SELECT
+        date,
+        menu_item_id,
+        menu_item_name,
+        truck_brand_name,
+        country,
+        location_id,
+        quantity,
+        net_sales
+    FROM tb_101.analytics_mart.fact_daily_item_sales
+    WHERE date >= DATEADD('day', -(days_back + 60), CURRENT_DATE());
+
+    CREATE OR REPLACE TEMP TABLE stats AS
+    SELECT
+        b.date,
+        b.menu_item_id,
+        AVG(b2.net_sales) AS mean_sales,
+        STDDEV_SAMP(b2.net_sales) AS std_sales,
+        MEDIAN(b2.net_sales) AS med_sales,
+        AVG(ABS(b2.net_sales - MEDIAN(b2.net_sales))) AS mad_sales,
+        AVG(b2.quantity) AS mean_qty,
+        STDDEV_SAMP(b2.quantity) AS std_qty,
+        MEDIAN(b2.quantity) AS med_qty,
+        AVG(ABS(b2.quantity - MEDIAN(b2.quantity))) AS mad_qty
+    FROM base b
+    JOIN base b2
+        ON b2.menu_item_id = b.menu_item_id
+       AND b2.date BETWEEN DATEADD('day', -60, b.date) AND DATEADD('day', -1, b.date)
+    GROUP BY b.date, b.menu_item_id;
+
+    CREATE OR REPLACE TEMP TABLE scored AS
+    SELECT
+        b.date,
+        'ITEM' AS grain,
+        b.menu_item_id AS id,
+        'NET_SALES' AS metric_name,
+        b.net_sales AS metric_value,
+        governance.ZSCORE(b.net_sales, s.mean_sales, s.std_sales) AS zscore,
+        governance.ROBUST_ZSCORE(b.net_sales, s.med_sales, s.mad_sales) AS robust_zscore,
+        IFF(ABS(COALESCE(governance.ZSCORE(b.net_sales, s.mean_sales, s.std_sales), 0)) >= 3
+            OR ABS(COALESCE(governance.ROBUST_ZSCORE(b.net_sales, s.med_sales, s.mad_sales), 0)) >= 3,
+            TRUE, FALSE) AS anomaly_flag,
+        OBJECT_CONSTRUCT('brand', b.truck_brand_name, 'country', b.country, 'location', b.location_id) AS context
+    FROM base b
+    LEFT JOIN stats s
+        ON s.date = b.date AND s.menu_item_id = b.menu_item_id
+    UNION ALL
+    SELECT
+        b.date,
+        'ITEM' AS grain,
+        b.menu_item_id AS id,
+        'QUANTITY' AS metric_name,
+        b.quantity AS metric_value,
+        governance.ZSCORE(b.quantity, s.mean_qty, s.std_qty) AS zscore,
+        governance.ROBUST_ZSCORE(b.quantity, s.med_qty, s.mad_qty) AS robust_zscore,
+        IFF(ABS(COALESCE(governance.ZSCORE(b.quantity, s.mean_qty, s.std_qty), 0)) >= 3
+            OR ABS(COALESCE(governance.ROBUST_ZSCORE(b.quantity, s.med_qty, s.mad_qty), 0)) >= 3,
+            TRUE, FALSE) AS anomaly_flag,
+        OBJECT_CONSTRUCT('brand', b.truck_brand_name, 'country', b.country, 'location', b.location_id) AS context
+    FROM base b
+    LEFT JOIN stats s
+        ON s.date = b.date AND s.menu_item_id = b.menu_item_id;
+
+    DELETE FROM tb_101.analytics_mart.sales_anomalies
+    WHERE date >= DATEADD('day', -days_back, CURRENT_DATE());
+
+    INSERT INTO tb_101.analytics_mart.sales_anomalies (date, grain, id, metric_name, metric_value, zscore, robust_zscore, anomaly_flag, context)
+    SELECT date, grain, id, metric_name, metric_value, zscore, robust_zscore, anomaly_flag, context
+    FROM scored
+    WHERE date >= DATEADD('day', -days_back, CURRENT_DATE());
+
+    RETURN 'Anomalies detected for last ' || days_back || ' days';
+END;
+$$;
+
+CREATE OR REPLACE PROCEDURE governance.sp_run_new_pipeline(days_back INTEGER DEFAULT 7)
+RETURNS STRING
+LANGUAGE SQL
+EXECUTE AS CALLER
+AS $$
+BEGIN
+    CALL governance.sp_build_fact_daily_item_sales(days_back);
+    CALL governance.sp_build_kpi_daily_brand(days_back);
+    CALL governance.sp_run_dq_checks(days_back);
+    CALL governance.sp_detect_sales_anomalies(GREATEST(days_back, 30));
+    RETURN 'New pipeline completed for last ' || days_back || ' days';
+END;
+$$;
+
+-- Scheduled Tasks: daily DAG for new pipeline (use existing privileges role pattern)
+USE ROLE accountadmin;
+USE WAREHOUSE tb_de_wh;
+USE DATABASE tb_101;
+
+CREATE OR REPLACE TASK tb_101.governance.t_np_build_fact_daily
+  WAREHOUSE = tb_de_wh
+  SCHEDULE = 'USING CRON 20 1 * * * UTC'
+  COMMENT = 'Build fact_daily_item_sales (new pipeline)'
+AS
+CALL tb_101.governance.sp_build_fact_daily_item_sales(7);
+
+CREATE OR REPLACE TASK tb_101.governance.t_np_build_kpi
+  WAREHOUSE = tb_de_wh
+  AFTER tb_101.governance.t_np_build_fact_daily
+AS
+CALL tb_101.governance.sp_build_kpi_daily_brand(7);
+
+CREATE OR REPLACE TASK tb_101.governance.t_np_dq_checks
+  WAREHOUSE = tb_de_wh
+  AFTER tb_101.governance.t_np_build_kpi
+AS
+CALL tb_101.governance.sp_run_dq_checks(7);
+
+CREATE OR REPLACE TASK tb_101.governance.t_np_anomaly
+  WAREHOUSE = tb_de_wh
+  AFTER tb_101.governance.t_np_dq_checks
+AS
+CALL tb_101.governance.sp_detect_sales_anomalies(30);
+
+ALTER TASK tb_101.governance.t_np_build_fact_daily RESUME;
+ALTER TASK tb_101.governance.t_np_build_kpi RESUME;
+ALTER TASK tb_101.governance.t_np_dq_checks RESUME;
+ALTER TASK tb_101.governance.t_np_anomaly RESUME;
+
+-- Grants for new schemas using existing roles
 USE ROLE securityadmin;
--- Additional Grants on semantic layer
-GRANT SELECT ON VIEW tb_101.semantic_layer.orders_v TO ROLE PUBLIC;
-GRANT SELECT ON VIEW tb_101.semantic_layer.customer_loyalty_metrics_v TO ROLE PUBLIC;
-GRANT READ ON STAGE tb_101.semantic_layer.semantic_model_stage TO ROLE tb_admin;
-GRANT WRITE ON STAGE tb_101.semantic_layer.semantic_model_stage TO ROLE tb_admin;
 
--- Configure Attendee Account Part 3 --
-USE ROLE ACCOUNTADMIN;
+GRANT ALL ON SCHEMA tb_101.analytics_mart TO ROLE tb_admin;
+GRANT ALL ON SCHEMA tb_101.analytics_mart TO ROLE tb_data_engineer;
+GRANT ALL ON SCHEMA tb_101.analytics_mart TO ROLE tb_dev;
+GRANT ALL ON SCHEMA tb_101.analytics_mart TO ROLE tb_analyst;
 
--- ability to run across cloud if claude is not in your region:
-ALTER ACCOUNT SET CORTEX_ENABLED_CROSS_REGION = 'ANY_REGION';
- 
- -- Create a database
-CREATE DATABASE IF NOT EXISTS snowflake_intelligence;
-CREATE SCHEMA IF NOT EXISTS snowflake_intelligence.agents;
+GRANT ALL ON SCHEMA tb_101.governance_logs TO ROLE tb_admin;
+GRANT ALL ON SCHEMA tb_101.governance_logs TO ROLE tb_data_engineer;
+GRANT ALL ON SCHEMA tb_101.governance_logs TO ROLE tb_dev;
 
--- create a schema to store the agents
-GRANT USAGE ON DATABASE snowflake_intelligence TO ROLE TB_DEV;
-GRANT USAGE ON SCHEMA snowflake_intelligence.agents TO ROLE TB_DEV;
+GRANT ALL ON FUTURE TABLES IN SCHEMA tb_101.analytics_mart TO ROLE tb_admin;
+GRANT ALL ON FUTURE TABLES IN SCHEMA tb_101.analytics_mart TO ROLE tb_data_engineer;
+GRANT ALL ON FUTURE TABLES IN SCHEMA tb_101.analytics_mart TO ROLE tb_dev;
+GRANT ALL ON FUTURE TABLES IN SCHEMA tb_101.analytics_mart TO ROLE tb_analyst;
 
--- Grant the CREATE AGENT privilege on the agents schema
-GRANT CREATE AGENT ON SCHEMA snowflake_intelligence.agents TO ROLE TB_DEV;
+-- restore role context
+USE ROLE sysadmin;
