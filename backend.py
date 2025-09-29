@@ -2,6 +2,9 @@ import json
 import re
 from typing import Any, Dict, List, Optional
 
+import requests
+import snowflake.connector
+import sqlparse
 import yaml
 
 try:
@@ -10,8 +13,202 @@ except Exception:  # pragma: no cover
     OpenAI = None  # type: ignore
 
 
+class SnowflakeConnectionError(Exception):
+    pass
+
+
 class OpenAIClientNotConfigured(Exception):
     pass
+
+
+def connect_to_snowflake(user, password, account, role=None, warehouse=None, database=None, schema=None):
+    try:
+        conn_params = {
+            'user': user,
+            'password': password,  # PAT used as password
+            'account': account
+        }
+        if role:
+            conn_params['role'] = role
+        if warehouse:
+            conn_params['warehouse'] = warehouse
+        if database:
+            conn_params['database'] = database
+        if schema:
+            conn_params['schema'] = schema
+        conn = snowflake.connector.connect(**conn_params)
+        return conn
+    except Exception as e:
+        raise SnowflakeConnectionError(str(e))
+
+
+def list_data_objects(conn):
+    try:
+        cur = conn.cursor()
+        cur.execute("SHOW DATABASES")
+        dbs = cur.fetchall()
+        db_names = [db[1] for db in dbs]
+        data = {}
+        for db in db_names:
+            cur.execute(f"SHOW SCHEMAS IN DATABASE {db}")
+            schemas = cur.fetchall()
+            schema_names = [s[1] for s in schemas]
+            data[db] = {}
+            for schema in schema_names:
+                cur.execute(f"SHOW TABLES IN {db}.{schema}")
+                tables = cur.fetchall()
+                table_names = [t[1] for t in tables]
+                cur.execute(f"SHOW VIEWS IN {db}.{schema}")
+                views = cur.fetchall()
+                view_names = [v[1] for v in views]
+                data[db][schema] = {
+                    'tables': table_names,
+                    'views': view_names
+                }
+        cur.close()
+        return data
+    except Exception as e:
+        raise Exception(f"Error fetching data objects: {e}")
+
+
+def get_schema_objects(conn, database, schema):
+    try:
+        cur = conn.cursor()
+        objects = {}
+        cur.execute(f"SHOW TABLES IN {database}.{schema}")
+        objects['tables'] = [row[1] for row in cur.fetchall()]
+        cur.execute(f"SHOW VIEWS IN {database}.{schema}")
+        objects['views'] = [row[1] for row in cur.fetchall()]
+        cur.execute(f"SHOW STAGES IN {database}.{schema}")
+        objects['stages'] = [row[1] for row in cur.fetchall()]
+        cur.execute(f"SHOW FILE FORMATS IN {database}.{schema}")
+        objects['file_formats'] = [row[1] for row in cur.fetchall()]
+        cur.execute(f"SHOW SEQUENCES IN {database}.{schema}")
+        objects['sequences'] = [row[1] for row in cur.fetchall()]
+        cur.execute(f"SHOW USER FUNCTIONS IN {database}.{schema}")
+        objects['user_functions'] = [row[1] for row in cur.fetchall()]
+        cur.execute(f"SHOW FUNCTIONS IN {database}.{schema}")
+        objects['functions'] = [row[1] for row in cur.fetchall()]
+        cur.execute(f"SHOW PROCEDURES IN {database}.{schema}")
+        objects['procedures'] = [row[1] for row in cur.fetchall()]
+        cur.execute(f"SHOW TASKS IN {database}.{schema}")
+        objects['tasks'] = [row[1] for row in cur.fetchall()]
+        cur.execute(f"SHOW STREAMS IN {database}.{schema}")
+        objects['streams'] = [row[1] for row in cur.fetchall()]
+        cur.execute(f"SHOW PIPES IN {database}.{schema}")
+        objects['pipes'] = [row[1] for row in cur.fetchall()]
+        cur.close()
+        return objects
+    except Exception as e:
+        raise Exception(f"Error fetching schema objects: {e}")
+
+
+def get_table_or_view_columns(conn, database, schema, object_name, object_type='table'):
+    try:
+        cur = conn.cursor()
+        if object_type == 'table':
+            cur.execute(f"SHOW COLUMNS IN TABLE {database}.{schema}.{object_name}")
+        elif object_type == 'view':
+            cur.execute(f"SHOW COLUMNS IN VIEW {database}.{schema}.{object_name}")
+        else:
+            raise Exception("object_type must be 'table' or 'view'")
+        columns = [
+            {
+                'name': row[2],
+                'type': row[3],
+                'nullable': row[6],
+                'default': row[7],
+                'kind': row[8]
+            }
+            for row in cur.fetchall()
+        ]
+        cur.close()
+        return columns
+    except Exception as e:
+        raise Exception(f"Error fetching columns for {object_type} {object_name}: {e}")
+
+
+def list_stages(conn, database):
+    try:
+        cur = conn.cursor()
+        cur.execute(f"SHOW STAGES IN DATABASE {database}")
+        stages = [(row[3], row[1]) for row in cur.fetchall()]  # (schema_name, stage_name)
+        cur.close()
+        return stages
+    except Exception as e:
+        raise Exception(f"Error fetching stages: {e}")
+
+
+def list_files_in_stage(conn, stage_full_name, database=None):
+    try:
+        cur = conn.cursor()
+        if database:
+            cur.execute(f'USE DATABASE {database}')
+        cur.execute(f"LIST @{stage_full_name}")
+        files = [row[0] for row in cur.fetchall()]
+        cur.close()
+        return files
+    except Exception as e:
+        raise Exception(f"Error listing files in stage {stage_full_name}: {e}")
+
+
+def get_presigned_url(conn, stage_full_name, file_name):
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT GET_PRESIGNED_URL(%s, %s)", (f"@{stage_full_name}", file_name))
+        url = cur.fetchone()[0]
+        cur.close()
+        return url
+    except Exception as e:
+        raise Exception(f"Error generating presigned URL for {file_name} in stage {stage_full_name}: {e}")
+
+
+def fetch_file_from_url(url):
+    try:
+        resp = requests.get(url)
+        resp.raise_for_status()
+        return resp.text
+    except Exception as e:
+        raise Exception(f"Error fetching file from presigned URL: {e}")
+
+
+def read_file_from_stage(conn, stage_full_name, file_name):
+    try:
+        url = get_presigned_url(conn, stage_full_name, file_name)
+        return fetch_file_from_url(url)
+    except Exception as e:
+        raise Exception(f"Error reading file {file_name} from stage {stage_full_name}: {e}")
+
+
+def split_sql_statements(sql_text):
+    return [stmt.strip() for stmt in sqlparse.split(sql_text) if stmt and stmt.strip()]
+
+
+def execute_sql_script(conn, sql_text):
+    results = []
+    statements = split_sql_statements(sql_text)
+    cur = conn.cursor()
+    for stmt in statements:
+        try:
+            cur.execute(stmt)
+            try:
+                rows = cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+            except Exception:
+                rows = 0
+            results.append({'statement': stmt[:2000], 'success': True, 'rows_affected': rows, 'error': ''})
+        except Exception as e:
+            results.append({'statement': stmt[:2000], 'success': False, 'rows_affected': 0, 'error': str(e)})
+    cur.close()
+    return results
+
+
+def execute_sql_file(conn, file_path):
+    try:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            sql_text = f.read()
+        return execute_sql_script(conn, sql_text)
+    except Exception as e:
+        raise Exception(f"Error executing SQL file {file_path}: {e}")
 
 
 def _get_client(openai_api_key: Optional[str]):
@@ -23,14 +220,8 @@ def _get_client(openai_api_key: Optional[str]):
 
 
 def generate_business_glossary_from_yaml(openai_api_key: str, yaml_content: str) -> Dict[str, Any]:
-    """
-    Call OpenAI to produce a business glossary JSON from the given semantic YAML string.
-    Returns a dict, attempting to parse JSON; if parsing fails, returns {'text': <raw>}.
-    """
     client = _get_client(openai_api_key)
-
     parsed = yaml.safe_load(yaml_content)
-
     prompt = (
         "You are a data governance expert. Given the following semantic YAML, produce a business glossary.\n"
         "Requirements:\n"
@@ -39,19 +230,16 @@ def generate_business_glossary_from_yaml(openai_api_key: str, yaml_content: str)
         "- JSON keys: columns (array of {table, column, definition, synonyms}), terms (optional array of {term, definition, related_columns, tables, dq_notes}).\n"
         "- In columns.synonyms, include up to 5 concise, business-friendly synonyms; omit duplicates.\n\n"
     )
-
     messages = [
         {"role": "system", "content": "You write precise, unambiguous business glossaries."},
         {"role": "user", "content": prompt + yaml.dump(parsed, sort_keys=False)},
     ]
-
     response = client.chat.completions.create(
         model="gpt-4o-mini",
         messages=messages,
         temperature=0.2,
     )
     ai_text = response.choices[0].message.content or ""
-
     try:
         return json.loads(ai_text)
     except Exception:
@@ -75,10 +263,6 @@ def generate_lineage_dot(
     include_column_lineage: bool = True,
     include_file_and_stage_sources: bool = True,
 ) -> str:
-    """
-    Call OpenAI to produce a Graphviz DOT diagram from lineage CSV rows and code blobs.
-    Returns raw DOT text.
-    """
     client = _get_client(openai_api_key)
 
     csv_section = ""
@@ -108,11 +292,9 @@ def generate_lineage_dot(
             elif lname.endswith(".scala"):
                 lang = "Scala"
             header = f"FILE: {name} (language: {lang})\n"
-            # Process full content per request (no truncation)
             parts.append(header + content)
         code_section = "\n\n".join(parts)
 
-    # Theme guidance for consistent styling
     theme = (theme or "vibrant").lower()
     if theme == "monochrome":
         palette = {
@@ -140,7 +322,7 @@ def generate_lineage_dot(
             "target_border": "#C62828",
             "target_fill": "#FFEBEE",
         }
-    else:  # vibrant default
+    else:
         palette = {
             "graph_bg": "white",
             "edge": "#7A7A7A",

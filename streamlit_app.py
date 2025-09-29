@@ -1,10 +1,10 @@
 import streamlit as st
-from snowflake_utils import connect_to_snowflake, list_data_objects, get_schema_objects, get_table_or_view_columns, list_stages, list_files_in_stage, read_file_from_stage, SnowflakeConnectionError
+from backend import connect_to_snowflake, list_data_objects, get_schema_objects, get_table_or_view_columns, list_stages, list_files_in_stage, read_file_from_stage, SnowflakeConnectionError
 import yaml
 import csv
 import io
 import re
-from ai_services import generate_business_glossary_from_yaml, generate_lineage_dot
+from backend import generate_business_glossary_from_yaml, generate_lineage_dot
 
 st.title("Business Glossary")
 
