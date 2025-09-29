@@ -1,4 +1,4 @@
-## EY Data Next — Governance, Glossary, and Lineage Toolkit
+## SNFL Data nxt — Governance, Glossary, and Lineage Toolkit
 
 This project provides a Streamlit-based UI to explore Snowflake objects, generate a business glossary using AI, and design data lineage diagrams. It also includes Snowflake SQL to provision a demo environment with roles, warehouses, schemas, raw tables, stages, and harmonized/analytics/semantic layer views.
 

@@ -6,9 +6,24 @@ import io
 import re
 from backend import generate_business_glossary_from_yaml, generate_lineage_dot
 
-st.title("Business Glossary")
+# Page configuration and lightweight theming
+st.set_page_config(page_title="SNFL Data nxt | Governance & Lineage", page_icon="📊", layout="wide")
+st.markdown(
+    """
+    <style>
+      .ey-app-title {font-size: 2rem; font-weight: 700; margin-bottom: 0.25rem;}
+      .ey-app-subtitle {color: #6b7280; font-size: 0.95rem; margin-top: 0;}
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+st.markdown("<div class='ey-app-title'>SNFL Data nxt</div>", unsafe_allow_html=True)
+st.markdown("<p class='ey-app-subtitle'>Business glossary generation, Snowflake exploration, and lineage design</p>", unsafe_allow_html=True)
+
+
 
 st.sidebar.header("Snowflake Connection")
+st.sidebar.caption("Provide credentials to explore objects and run features")
 
 account = st.sidebar.text_input("Account Identifier", key="account")
 user = st.sidebar.text_input("Username", key="user")
@@ -43,10 +58,11 @@ if st.sidebar.button("Connect"):
 
 if st.session_state.get("connected") and st.session_state.get("conn"):
     conn = st.session_state['conn']
-    section = st.radio("Choose a module:", ["Data Object Explorer", "Business Glossary", "Lineage Designer"])  # removed setup
+    section = st.radio("Modules", ["Data Object Explorer", "Business Glossary", "Lineage Studio"])  # removed setup
 
     if section == "Data Object Explorer":
         st.header("Data Object Explorer")
+        st.caption("Browse databases, schemas, and objects in your Snowflake account")
         try:
             data = list_data_objects(conn)
             db_names = sorted(data.keys())
@@ -110,8 +126,8 @@ if st.session_state.get("connected") and st.session_state.get("conn"):
             st.error(str(e))
 
     elif section == "Business Glossary":
-        st.header("Business Glossary")
-        st.caption("Upload a semantic YAML file to generate column-level definitions and synonyms.")
+        st.header("Business Glossary Generator")
+        st.caption("Upload semantic YAML to generate per-column definitions and synonyms")
 
         # OpenAI API key input
         with st.sidebar:
@@ -197,15 +213,15 @@ if st.session_state.get("connected") and st.session_state.get("conn"):
         else:
             st.info("Upload a semantic YAML file to begin.")
 
-    elif section == "Lineage Designer":
-        st.header("Lineage Designer")
-        st.caption("Upload lineage CSV and related SQL/Python code to generate a lineage diagram.")
+    elif section == "Lineage Studio":
+        st.header("Lineage Studio")
+        st.caption("Generate an interactive lineage diagram from CSV relationships and code context")
 
         # OpenAI API key input (shared key name to reuse value if already set)
         with st.sidebar:
             openai_api_key = st.text_input("OpenAI API Key", type="password", key="openai_api_key")
 
-        lineage_csv = st.file_uploader("Upload Lineage CSV", type=["csv"], key="lineage_csv_upload")
+        lineage_csv = st.file_uploader("Upload lineage relationships (CSV)", type=["csv"], key="lineage_csv_upload")
         code_files = st.file_uploader(
             "Upload Pipeline Code Files (SQL/Python/Java/Scala)",
             type=["sql", "py", "java", "scala"],
@@ -235,12 +251,12 @@ if st.session_state.get("connected") and st.session_state.get("conn"):
                 except Exception as e:
                     st.markdown(f"- `{f.name}` (error reading: {e})")
 
-        target = st.text_input("Target table/view for focused lineage (optional)", key="lineage_target")
-        max_hops = st.slider("Max hops from target (upstream/downstream)", min_value=1, max_value=5, value=2, key="lineage_hops")
+        target = st.text_input("Target object (table/view) for focused lineage", key="lineage_target", help="Optional; centers the diagram on this node")
+        max_hops = st.slider("Max hops from target (both directions)", min_value=1, max_value=5, value=2, key="lineage_hops")
         theme = st.selectbox("Diagram theme", options=["vibrant", "muted", "monochrome"], index=0, key="lineage_theme")
         detail_level = st.selectbox("Detail level", options=["low", "medium", "high"], index=2, key="lineage_detail")
         include_sql_snippets = st.checkbox("Include SQL snippet excerpts", value=False, key="lineage_snippets")
-        show_edge_labels = st.checkbox("Show edge operation labels (joins, agg, filter)", value=True, key="lineage_edge_labels")
+        show_edge_labels = st.checkbox("Show edge operation labels (joins, aggregation, filters)", value=True, key="lineage_edge_labels")
         show_node_tooltips = st.checkbox("Show node tooltips (summaries)", value=True, key="lineage_tooltips")
         include_ctes = st.checkbox("Include CTEs as nodes", value=True, key="lineage_ctes")
         include_column_lineage = st.checkbox("Include column-level lineage hints", value=True, key="lineage_col_lineage")
